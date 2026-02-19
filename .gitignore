@@ -1,4 +1,6 @@
 build
+build.bat
+.cache
 
 # Prerequisites
 *.d
