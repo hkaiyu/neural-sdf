@@ -1,6 +1,6 @@
 build
-build.bat
 .cache
+.vs
 
 # Prerequisites
 *.d
