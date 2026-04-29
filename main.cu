@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <direct.h>
 #include <memory>
 #include <string>
 #include <vector>
@@ -657,7 +659,8 @@ static HashGridLayout compute_hash_grid_layout(int n_levels, int base_res,
 static constexpr uint32_t kHashPrimes[3] = {1u, 2654435761u, 805459861u};
 
 __device__ __forceinline__ int hash3(int ix, int iy, int iz, int n_entries) {
-  uint32_t h = ((uint32_t)ix * kHashPrimes[0]) ^ ((uint32_t)iy * kHashPrimes[1]) ^
+  uint32_t h = ((uint32_t)ix * kHashPrimes[0]) ^
+               ((uint32_t)iy * kHashPrimes[1]) ^
                ((uint32_t)iz * kHashPrimes[2]);
   return (int)(h % (uint32_t)n_entries);
 }
@@ -669,8 +672,8 @@ __device__ __forceinline__ int hash3(int ix, int iy, int iz, int n_entries) {
 // alias. For levels with hash collisions, write races are benign: all
 // contending threads write a valid spatially-averaged value.
 __global__ void smooth_hash_level(const __half *__restrict__ src, __half *dst,
-                                  int n_entries, int n_features,
-                                  int res, int res_eff, float sigma) {
+                                  int n_entries, int n_features, int res,
+                                  int res_eff, float sigma) {
   int cell = blockIdx.x * blockDim.x + threadIdx.x;
   int n_cells = res_eff * res_eff * res_eff;
   if (cell >= n_cells)
@@ -707,14 +710,149 @@ __global__ void smooth_hash_level(const __half *__restrict__ src, __half *dst,
   }
 }
 
+// Accumulate L1-TV gradient for one hash level into a float buffer (must be
+// zero-initialized). Skips neighbor pairs that resolve to the same hash entry
+// (collision-aware masking) so self-regularization on aliased cells is avoided.
+__global__ void accumulate_tv_gradient(const __half *__restrict__ src,
+                                       float *tv_acc, int n_entries,
+                                       int n_features, int res, int res_eff,
+                                       float lambda_tv) {
+  int cell = blockIdx.x * blockDim.x + threadIdx.x;
+  int n_cells = res_eff * res_eff * res_eff;
+  if (cell >= n_cells)
+    return;
+
+  int iz = cell / (res_eff * res_eff);
+  int iy = (cell / res_eff) % res_eff;
+  int ix = cell % res_eff;
+
+  int fx = ix * res / res_eff;
+  int fy = iy * res / res_eff;
+  int fz = iz * res / res_eff;
+
+  int ce = hash3(fx, fy, fz, n_entries);
+
+  const int offx[6] = {1, -1, 0, 0, 0, 0};
+  const int offy[6] = {0, 0, 1, -1, 0, 0};
+  const int offz[6] = {0, 0, 0, 0, 1, -1};
+
+  for (int d = 0; d < 6; ++d) {
+    int nx = max(0, min(res - 1, fx + offx[d]));
+    int ny = max(0, min(res - 1, fy + offy[d]));
+    int nz = max(0, min(res - 1, fz + offz[d]));
+    int ne = hash3(nx, ny, nz, n_entries);
+    if (ne == ce)
+      continue; // collision-aware: skip aliased pairs
+
+    for (int f = 0; f < n_features; ++f) {
+      float vc = __half2float(src[ce * n_features + f]);
+      float vn = __half2float(src[ne * n_features + f]);
+      float delta = vc - vn;
+      float g = lambda_tv * (delta > 0.f ? 1.f : delta < 0.f ? -1.f : 0.f);
+      atomicAdd(&tv_acc[ce * n_features + f], g);
+    }
+  }
+}
+
+// Add a float TV gradient buffer into a half gradient buffer element-wise.
+__global__ void add_float_to_half_grad(const float *__restrict__ tv_acc,
+                                       __half *grad_buf, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n)
+    return;
+  grad_buf[i] = __float2half(__half2float(grad_buf[i]) + tv_acc[i]);
+}
+
+// ---------- Eikonal regularization ----------
+
+// Build 6 FD offset positions for N_eik sample points.
+// For sample i, offset j occupies column j*N_eik + i of the output matrix.
+__global__ void build_eikonal_offsets(int N_eik, float eps,
+                                      const float *__restrict__ pts_in,
+                                      float *__restrict__ pts_out) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N_eik)
+    return;
+  float x = pts_in[i * 3 + 0], y = pts_in[i * 3 + 1], z = pts_in[i * 3 + 2];
+  const float ox[6] = {eps, -eps, 0, 0, 0, 0};
+  const float oy[6] = {0, 0, eps, -eps, 0, 0};
+  const float oz[6] = {0, 0, 0, 0, eps, -eps};
+  for (int j = 0; j < 6; ++j) {
+    pts_out[(j * N_eik + i) * 3 + 0] = x + ox[j];
+    pts_out[(j * N_eik + i) * 3 + 1] = y + oy[j];
+    pts_out[(j * N_eik + i) * 3 + 2] = z + oz[j];
+  }
+}
+
+// Compute dL_eik/dSDF_out for the 6*N_eik offset SDF values.
+// The eik_grad_buf must be zeroed before this kernel (only feature 0 is
+// written). Loss per sample i: lambda_eik * (||FD_grad_i|| - 1)^2.
+__global__ void compute_eikonal_grad(int N_eik, int padded_out, float eps,
+                                     float lambda_eik, float loss_scale,
+                                     const __half *__restrict__ sdf_vals,
+                                     __half *__restrict__ dL_dsdf) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N_eik)
+    return;
+
+  float sv[6];
+  for (int j = 0; j < 6; ++j)
+    sv[j] = __half2float(sdf_vals[(j * N_eik + i) * padded_out]);
+
+  float gx = (sv[0] - sv[1]) / (2.f * eps);
+  float gy = (sv[2] - sv[3]) / (2.f * eps);
+  float gz = (sv[4] - sv[5]) / (2.f * eps);
+  float norm = sqrtf(gx * gx + gy * gy + gz * gz + 1e-8f);
+  float r = norm - 1.f;
+  // Clamp denominator so near-zero gradients don't blow up.
+  float c = 2.f * lambda_eik * r /
+            (fmaxf(norm, 0.01f) * 2.f * eps * (float)N_eik) * loss_scale;
+
+  const float comp[6] = {gx, -gx, gy, -gy, gz, -gz};
+  for (int j = 0; j < 6; ++j)
+    dL_dsdf[(j * N_eik + i) * padded_out + 0] = __float2half(c * comp[j]);
+}
+
 // ---------- main ----------
 using namespace tcnn;
 using precision_t = network_precision_t;
 
 int main(int argc, char **argv) {
   const char *mesh_path = "../data/bunny.obj";
-  if (argc >= 2)
-    mesh_path = argv[1];
+  const char *run_name = "default";
+  float smooth_sigma = 0.f;
+  float lambda_tv = 0.f;
+  float lambda_eik = 0.f;
+  float eik_eps = 0.001f;
+  int tv_level_min = 11, tv_level_max = 15;
+  int max_steps = 0;
+  int hashmap_size = 19;
+  int n_hash_levels = 16;
+
+  for (int ai = 1; ai < argc; ++ai) {
+    if (strcmp(argv[ai], "--run") == 0 && ai + 1 < argc)
+      run_name = argv[++ai];
+    else if (strcmp(argv[ai], "--sigma") == 0 && ai + 1 < argc)
+      smooth_sigma = (float)atof(argv[++ai]);
+    else if (strcmp(argv[ai], "--lambda_tv") == 0 && ai + 1 < argc)
+      lambda_tv = (float)atof(argv[++ai]);
+    else if (strcmp(argv[ai], "--lambda_eik") == 0 && ai + 1 < argc)
+      lambda_eik = (float)atof(argv[++ai]);
+    else if (strcmp(argv[ai], "--eik_eps") == 0 && ai + 1 < argc)
+      eik_eps = (float)atof(argv[++ai]);
+    else if (strcmp(argv[ai], "--tv_min") == 0 && ai + 1 < argc)
+      tv_level_min = atoi(argv[++ai]);
+    else if (strcmp(argv[ai], "--tv_max") == 0 && ai + 1 < argc)
+      tv_level_max = atoi(argv[++ai]);
+    else if (strcmp(argv[ai], "--max_steps") == 0 && ai + 1 < argc)
+      max_steps = atoi(argv[++ai]);
+    else if (strcmp(argv[ai], "--hashmap_size") == 0 && ai + 1 < argc)
+      hashmap_size = atoi(argv[++ai]);
+    else if (strcmp(argv[ai], "--n_levels") == 0 && ai + 1 < argc)
+      n_hash_levels = atoi(argv[++ai]);
+    else if (argv[ai][0] != '-')
+      mesh_path = argv[ai];
+  }
 
   std::vector<Triangle> tris;
   float3 bbox_min{}, bbox_max{};
@@ -723,6 +861,32 @@ int main(int argc, char **argv) {
   normalize_mesh(tris, bbox_min, bbox_max);
   int n_tris = (int)tris.size();
   printf("Loaded %s: %d triangles\n", mesh_path, n_tris);
+
+  // Extract stem (basename without extension) for the results subdirectory.
+  const char *mesh_basename = mesh_path;
+  for (const char *p = mesh_path; *p; ++p)
+    if (*p == '/' || *p == '\\')
+      mesh_basename = p + 1;
+  char mesh_stem[256];
+  strncpy(mesh_stem, mesh_basename, sizeof(mesh_stem) - 1);
+  mesh_stem[sizeof(mesh_stem) - 1] = '\0';
+  char *stem_dot = strrchr(mesh_stem, '.');
+  if (stem_dot) *stem_dot = '\0';
+
+  char results_dir[512];
+  snprintf(results_dir, sizeof(results_dir), "results/%s", mesh_stem);
+  _mkdir("results");
+  _mkdir(results_dir);
+
+  char metrics_path[600];
+  snprintf(metrics_path, sizeof(metrics_path), "%s/%s_metrics.csv", results_dir, run_name);
+  FILE *metrics_file = fopen(metrics_path, "w");
+  if (metrics_file)
+    fprintf(metrics_file,
+            "step,sigma,lambda_tv,lambda_eik,hashmap_size,n_levels,"
+            "chamfer_dist,gt_to_learned,learned_to_gt,normal_err_deg,"
+            "grain_roughness,n_hits\n");
+  printf("Run '%s'  mesh '%s'  output -> %s/\n", run_name, mesh_stem, results_dir);
 
   // Window
   RGFW_glHints *hints = RGFW_getGlobalHints_OpenGL();
@@ -913,9 +1077,9 @@ int main(int argc, char **argv) {
             {"l2_reg", 1e-6f}}}}}}},
       {"encoding",
        {{"otype", "HashGrid"},
-        {"n_levels", 16},
+        {"n_levels", n_hash_levels},
         {"n_features_per_level", 2},
-        {"log2_hashmap_size", 19},
+        {"log2_hashmap_size", hashmap_size},
         {"base_resolution", 16},
         {"per_level_scale", 1.3819f}}},
       {"network",
@@ -946,7 +1110,8 @@ int main(int argc, char **argv) {
   GPUMemory<precision_t> dL_dsdf_buf(padded_out * RENDER_N);
   GPUMatrix<precision_t> dL_dsdf_mat(dL_dsdf_buf.data(), padded_out, RENDER_N);
   GPUMemory<precision_t> ray_sdf_half_buf(padded_out * RENDER_N);
-  GPUMatrix<precision_t> ray_sdf_half_out(ray_sdf_half_buf.data(), padded_out, RENDER_N);
+  GPUMatrix<precision_t> ray_sdf_half_out(ray_sdf_half_buf.data(), padded_out,
+                                          RENDER_N);
 
   auto reset_training = [&]() {
     CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
@@ -963,7 +1128,8 @@ int main(int argc, char **argv) {
   glUniform1i(uTexLoc, 0);
 
   // Hash-grid smoothing state
-  constexpr int kHashLevels = 16, kHashFeat = 2, kHashLog2 = 19;
+  const int kHashLevels = n_hash_levels, kHashFeat = 2,
+            kHashLog2 = hashmap_size;
   constexpr int kHashBaseRes = 16;
   constexpr float kHashScale = 1.3819f;
   HashGridLayout hg_layout = compute_hash_grid_layout(
@@ -972,7 +1138,16 @@ int main(int argc, char **argv) {
   int max_level_entries = *std::max_element(
       hg_layout.entry_counts, hg_layout.entry_counts + kHashLevels);
   GPUMemory<__half> smooth_tmp_buf(max_level_entries * kHashFeat);
-  float smooth_sigma = 0.f;
+  GPUMemory<float> tv_tmp_buf(max_level_entries * kHashFeat);
+
+  constexpr int N_EIK = 1024;
+  GPUMemory<float> eik_pts_buf(3 * 6 * N_EIK);
+  GPUMemory<precision_t> eik_sdf_buf(padded_out * 6 * N_EIK);
+  GPUMemory<precision_t> eik_grad_buf(padded_out * 6 * N_EIK);
+  GPUMatrix<float> eik_input_mat(eik_pts_buf.data(), 3, 6 * N_EIK);
+  GPUMatrix<precision_t> eik_sdf_mat(eik_sdf_buf.data(), padded_out, 6 * N_EIK);
+  GPUMatrix<precision_t> eik_grad_mat(eik_grad_buf.data(), padded_out,
+                                      6 * N_EIK);
 
   bool running = true;
   bool training_enabled = true;
@@ -982,16 +1157,17 @@ int main(int argc, char **argv) {
 
   int render_mode = 0;
   float last_chamfer = 0.f, last_gt_to_learned = 0.f, last_learned_to_gt = 0.f;
-  float last_normal_err = 0.f;
+  float last_normal_err = 0.f, last_grain_roughness = 0.f;
   int last_n_hits = 0;
-  bool metrics_logging = false;
-  FILE *metrics_file = nullptr;
   std::vector<float> cpu_gt_sdf(N_METRIC_SAMPLES);
   std::vector<float> cpu_dist(RENDER_N);
   std::vector<float> cpu_err(RENDER_N);
   std::vector<int> cpu_hit_count(1, 0);
+  std::vector<float> cpu_normals(3 * RENDER_N);
+  std::vector<uint8_t> cpu_ray_mask(RENDER_N);
 
   std::vector<uint8_t> render_pixels(RENDER_W * RENDER_H * 4);
+  GPUMemory<uchar4> snap_buf(RENDER_N);
 
   constexpr int kHistSz = 512;
   std::vector<float> loss_history(kHistSz, 0.f);
@@ -1054,9 +1230,48 @@ int main(int argc, char **argv) {
           training_batch.data(), training_target.data());
       CUDA_CHECK_THROW(cudaGetLastError());
 
-      auto ctx =
-          trainer->training_step(stream, training_batch, training_target);
+      auto ctx = trainer->training_step(stream, training_batch, training_target,
+                                        nullptr, /*run_optimizer=*/false);
       current_loss = trainer->loss(stream, *ctx);
+
+      if (lambda_tv > 0.f) {
+        __half *params = network->encoding()->params();
+        __half *grad = trainer->param_gradients();
+        int lmin = max(0, min(15, tv_level_min));
+        int lmax = max(lmin, min(15, tv_level_max));
+        for (int k = lmin; k <= lmax; ++k) {
+          int ne = hg_layout.entry_counts[k];
+          int res = hg_layout.cell_res[k];
+          long long res3 = (long long)res * res * res;
+          int res_eff = (res3 <= (long long)ne) ? res : (int)cbrtf((float)ne);
+          int n_cells = res_eff * res_eff * res_eff;
+          CUDA_CHECK_THROW(cudaMemsetAsync(
+              tv_tmp_buf.data(), 0, ne * kHashFeat * sizeof(float), stream));
+          accumulate_tv_gradient<<<(n_cells + 255) / 256, 256, 0, stream>>>(
+              params + hg_layout.offsets[k], tv_tmp_buf.data(), ne, kHashFeat,
+              res, res_eff, lambda_tv);
+          add_float_to_half_grad<<<(ne * kHashFeat + 255) / 256, 256, 0,
+                                   stream>>>(
+              tv_tmp_buf.data(), grad + hg_layout.offsets[k], ne * kHashFeat);
+        }
+      }
+      if (lambda_eik > 0.f) {
+        build_eikonal_offsets<<<(N_EIK + 255) / 256, 256, 0, stream>>>(
+            N_EIK, eik_eps, training_batch.data(), eik_pts_buf.data());
+        auto eik_ctx =
+            network->forward(stream, eik_input_mat, &eik_sdf_mat, false, false);
+        CUDA_CHECK_THROW(cudaMemsetAsync(
+            eik_grad_buf.data(), 0,
+            padded_out * 6 * N_EIK * sizeof(precision_t), stream));
+        compute_eikonal_grad<<<(N_EIK + 255) / 256, 256, 0, stream>>>(
+            N_EIK, padded_out, eik_eps, lambda_eik,
+            (float)default_loss_scale<precision_t>(), eik_sdf_buf.data(),
+            eik_grad_buf.data());
+        network->backward(stream, *eik_ctx, eik_input_mat, eik_sdf_mat,
+                          eik_grad_mat, nullptr, false,
+                          GradientMode::Accumulate);
+      }
+      trainer->optimizer_step(stream, default_loss_scale<precision_t>());
 
       if (smooth_sigma > 0.f) {
         __half *inf = network->encoding()->inference_params();
@@ -1066,14 +1281,15 @@ int main(int argc, char **argv) {
           long long res3 = (long long)res * res * res;
           int res_eff = (res3 <= (long long)ne) ? res : (int)cbrtf((float)ne);
           int n_cells = res_eff * res_eff * res_eff;
-          // Init tmp with src so entries not covered by coarse grid keep their values.
+          // Init tmp with src so entries not covered by coarse grid keep their
+          // values.
           CUDA_CHECK_THROW(cudaMemcpyAsync(smooth_tmp_buf.data(),
                                            inf + hg_layout.offsets[k],
                                            ne * kHashFeat * sizeof(__half),
                                            cudaMemcpyDeviceToDevice, stream));
           smooth_hash_level<<<(n_cells + 255) / 256, 256, 0, stream>>>(
-              inf + hg_layout.offsets[k], smooth_tmp_buf.data(),
-              ne, kHashFeat, res, res_eff, smooth_sigma);
+              inf + hg_layout.offsets[k], smooth_tmp_buf.data(), ne, kHashFeat,
+              res, res_eff, smooth_sigma);
           CUDA_CHECK_THROW(cudaMemcpyAsync(inf + hg_layout.offsets[k],
                                            smooth_tmp_buf.data(),
                                            ne * kHashFeat * sizeof(__half),
@@ -1086,6 +1302,8 @@ int main(int argc, char **argv) {
       if (hist_count < kHistSz)
         ++hist_count;
       ++step;
+      if (max_steps > 0 && step >= (uint32_t)max_steps)
+        running = false;
     }
 
     // ----- Sphere-tracing render -----
@@ -1123,6 +1341,28 @@ int main(int argc, char **argv) {
         reinterpret_cast<uchar4 *>(pbo_ptr));
     CUDA_CHECK_THROW(cudaGraphicsUnmapResources(1, &cuda_pbo_res, stream));
 
+    // Auto-save normal-map PNG at step 1000 and at the final step.
+    if (training_enabled) {
+      bool at_milestone = (step == 1000);
+      bool at_final = (max_steps > 0 && step == (uint32_t)max_steps);
+      if (at_milestone || at_final) {
+        shade_and_pack<<<ray_blocks1d, 256, 0, stream>>>(
+            RENDER_N, analytic_normal_buf.data(), ray_pos_buf.data(),
+            ray_dir_buf.data(), ray_mask_buf.data(), light_pos, 1,
+            snap_buf.data());
+        CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+        snap_buf.copy_to_host(reinterpret_cast<uchar4 *>(render_pixels.data()));
+        char snap_path[600];
+        snprintf(snap_path, sizeof(snap_path), "%s/%s_normal_%05u.png",
+                 results_dir, run_name, step);
+        stbi_flip_vertically_on_write(1);
+        stbi_write_png(snap_path, RENDER_W, RENDER_H, 4, render_pixels.data(),
+                       RENDER_W * 4);
+        stbi_flip_vertically_on_write(0);
+        printf("Saved %s\n", snap_path);
+      }
+    }
+
     // ----- Metrics (every METRIC_INTERVAL training steps) -----
     if (training_enabled && step > 0 && step % METRIC_INTERVAL == 0) {
       sample_gt_surface_points<<<(N_METRIC_SAMPLES + 255) / 256, 256, 0,
@@ -1145,6 +1385,8 @@ int main(int argc, char **argv) {
       metric_dist_buf.copy_to_host(cpu_dist.data(), RENDER_N);
       metric_err_buf.copy_to_host(cpu_err.data(), RENDER_N);
       metric_hit_count_buf.copy_to_host(cpu_hit_count.data(), 1);
+      analytic_normal_buf.copy_to_host(cpu_normals.data(), 3 * RENDER_N);
+      ray_mask_buf.copy_to_host(cpu_ray_mask.data(), RENDER_N);
 
       last_n_hits = cpu_hit_count[0];
 
@@ -1165,10 +1407,48 @@ int main(int argc, char **argv) {
       }
       last_chamfer = 0.5f * (last_gt_to_learned + last_learned_to_gt);
 
-      if (metrics_logging && metrics_file) {
-        fprintf(metrics_file, "%u,%.4f,%.8f,%.8f,%.8f,%.4f,%d\n", step,
-                smooth_sigma, last_chamfer, last_gt_to_learned,
-                last_learned_to_gt, last_normal_err, last_n_hits);
+      // Grain roughness: mean angular deviation between adjacent hit-pixel
+      // normals.
+      {
+        float rsum = 0.f;
+        int rcnt = 0;
+        for (int py = 1; py < RENDER_H - 1; ++py) {
+          for (int px = 1; px < RENDER_W - 1; ++px) {
+            int i = py * RENDER_W + px;
+            if (cpu_ray_mask[i] != 1)
+              continue;
+            float nx = cpu_normals[i * 3], ny = cpu_normals[i * 3 + 1],
+                  nz = cpu_normals[i * 3 + 2];
+            float nl = sqrtf(nx * nx + ny * ny + nz * nz + 1e-8f);
+            nx /= nl;
+            ny /= nl;
+            nz /= nl;
+            const int nbs[4] = {i - 1, i + 1, i - RENDER_W, i + RENDER_W};
+            for (int nb : nbs) {
+              if (cpu_ray_mask[nb] != 1)
+                continue;
+              float mx = cpu_normals[nb * 3], my = cpu_normals[nb * 3 + 1],
+                    mz = cpu_normals[nb * 3 + 2];
+              float ml = sqrtf(mx * mx + my * my + mz * mz + 1e-8f);
+              mx /= ml;
+              my /= ml;
+              mz /= ml;
+              float dot = fmaxf(-1.f, fminf(1.f, nx * mx + ny * my + nz * mz));
+              rsum += acosf(fabsf(dot)) * (180.f / 3.14159265f);
+              ++rcnt;
+            }
+          }
+        }
+        last_grain_roughness = rcnt > 0 ? rsum / rcnt : 0.f;
+      }
+
+      if (metrics_file) {
+        fprintf(metrics_file,
+                "%u,%.4f,%.2e,%.2e,%d,%d,%.8f,%.8f,%.8f,%.4f,%.4f,%d\n", step,
+                smooth_sigma, lambda_tv, lambda_eik, hashmap_size,
+                n_hash_levels, last_chamfer, last_gt_to_learned,
+                last_learned_to_gt, last_normal_err, last_grain_roughness,
+                last_n_hits);
         fflush(metrics_file);
       }
     }
@@ -1250,9 +1530,9 @@ int main(int argc, char **argv) {
     ImGui::RadioButton("Normals", &render_mode, 1);
     ImGui::SameLine();
     if (ImGui::Button("Save PNG")) {
-      char fname[64];
-      snprintf(fname, sizeof(fname), "render_%04u_s%.2f.png", step,
-               smooth_sigma);
+      char fname[600];
+      snprintf(fname, sizeof(fname), "%s/%s_render_%05u.png", results_dir,
+               run_name, step);
       glBindTexture(GL_TEXTURE_2D, tex);
       stbi_flip_vertically_on_write(1);
       glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE,
@@ -1261,6 +1541,7 @@ int main(int argc, char **argv) {
                      RENDER_W * 4);
       stbi_flip_vertically_on_write(0);
       glBindTexture(GL_TEXTURE_2D, 0);
+      printf("Saved %s\n", fname);
     }
     ImGui::Separator();
     ImGui::Text("Chamfer:     %.6f", last_chamfer);
@@ -1268,28 +1549,20 @@ int main(int argc, char **argv) {
                 last_learned_to_gt);
     ImGui::Text("Normal err:  %.2f deg  (%d hits)", last_normal_err,
                 last_n_hits);
+    ImGui::Text("Grain rough: %.4f deg", last_grain_roughness);
     ImGui::TextDisabled("(updated every %d steps)", METRIC_INTERVAL);
     ImGui::Separator();
     ImGui::SliderFloat("Smooth sigma", &smooth_sigma, 0.f, 3.f, "%.2f");
+    ImGui::SliderFloat("TV lambda", &lambda_tv, 0.f, 1e-4f, "%.2e");
+    ImGui::SliderInt("TV level min", &tv_level_min, 0, 15);
+    ImGui::SliderInt("TV level max", &tv_level_max, 0, 15);
+    ImGui::SliderFloat("Eikonal lambda", &lambda_eik, 0.f, 0.1f, "%.4f");
+    ImGui::SliderFloat("Eikonal eps", &eik_eps, 1e-4f, 1e-2f, "%.4f");
     ImGui::Separator();
-    if (!metrics_logging) {
-      if (ImGui::Button("Start CSV Logging")) {
-        metrics_file = fopen("metrics.csv", "w");
-        if (metrics_file) {
-          fprintf(metrics_file, "step,sigma,chamfer_dist,gt_to_learned,learned_"
-                                "to_gt,normal_err_deg,n_hits\n");
-          metrics_logging = true;
-        }
-      }
-    } else {
-      if (ImGui::Button("Stop Logging")) {
-        fclose(metrics_file);
-        metrics_file = nullptr;
-        metrics_logging = false;
-      }
-      ImGui::SameLine();
-      ImGui::TextColored(ImVec4(0.4f, 1.f, 0.4f, 1.f), "-> metrics.csv");
-    }
+    ImGui::Text("Run: %s", run_name);
+    ImGui::TextDisabled("Output: %s/", results_dir);
+    if (max_steps > 0)
+      ImGui::Text("Max steps: %d", max_steps);
     ImGui::End();
 
     ImGui::Render();
