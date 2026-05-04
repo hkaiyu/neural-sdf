@@ -38,8 +38,7 @@ static const int SCR_HEIGHT = 700;
 static const int RENDER_W = 512;
 static const int RENDER_H = 512;
 static const int RENDER_N = RENDER_W * RENDER_H; // 262144, divisible by 128
-static const int N_METRIC_SAMPLES =
-    2048; // GT surface samples for Chamfer GT→Learned
+static const int N_METRIC_SAMPLES = 2048;
 static const int METRIC_INTERVAL = 100; // steps between metric evaluations
 
 // ---------- GL shaders ----------
@@ -102,6 +101,12 @@ static GLuint createProgram(const char *vs, const char *fs) {
 struct Triangle {
   float3 v0, v1, v2;
   float3 n; // unit outward face normal
+};
+
+struct BVHNode {
+  float3 lo, hi;
+  int left;  // leaf: triangle index; internal: left child index
+  int right; // leaf: -1; internal: right child index
 };
 
 // Loads triangles from an OBJ file. Handles bare vertex indices and v/vt/vn
@@ -198,8 +203,78 @@ static void normalize_mesh(std::vector<Triangle> &tris, const float3 &lo,
     t.v0 = xv(t.v0);
     t.v1 = xv(t.v1);
     t.v2 = xv(t.v2);
-    // normals unchanged by uniform scale + translation
   }
+}
+
+// ---------- BVH stuff ----------
+
+static void bvh_expand_aabb(float3 &lo, float3 &hi, float3 v) {
+  if (v.x < lo.x)
+    lo.x = v.x;
+  if (v.x > hi.x)
+    hi.x = v.x;
+  if (v.y < lo.y)
+    lo.y = v.y;
+  if (v.y > hi.y)
+    hi.y = v.y;
+  if (v.z < lo.z)
+    lo.z = v.z;
+  if (v.z > hi.z)
+    hi.z = v.z;
+}
+
+static float tri_centroid_axis(const Triangle &t, int axis) {
+  if (axis == 0)
+    return (t.v0.x + t.v1.x + t.v2.x) * (1.f / 3.f);
+  if (axis == 1)
+    return (t.v0.y + t.v1.y + t.v2.y) * (1.f / 3.f);
+  return (t.v0.z + t.v1.z + t.v2.z) * (1.f / 3.f);
+}
+
+static int build_bvh_recursive(std::vector<BVHNode> &nodes,
+                               const std::vector<Triangle> &tris,
+                               std::vector<int> &indices, int start, int end) {
+  int node_idx = (int)nodes.size();
+  nodes.push_back({});
+
+  float3 lo = {1e30f, 1e30f, 1e30f}, hi = {-1e30f, -1e30f, -1e30f};
+  for (int i = start; i < end; ++i) {
+    const Triangle &t = tris[indices[i]];
+    bvh_expand_aabb(lo, hi, t.v0);
+    bvh_expand_aabb(lo, hi, t.v1);
+    bvh_expand_aabb(lo, hi, t.v2);
+  }
+  nodes[node_idx].lo = lo;
+  nodes[node_idx].hi = hi;
+
+  if (end - start == 1) {
+    nodes[node_idx].left = indices[start];
+    nodes[node_idx].right = -1;
+    return node_idx;
+  }
+
+  float dx = hi.x - lo.x, dy = hi.y - lo.y, dz = hi.z - lo.z;
+  int axis = (dx >= dy && dx >= dz) ? 0 : (dy >= dz ? 1 : 2);
+  int mid = (start + end) / 2;
+  std::sort(indices.begin() + start, indices.begin() + end, [&](int a, int b) {
+    return tri_centroid_axis(tris[a], axis) < tri_centroid_axis(tris[b], axis);
+  });
+
+  int left_child = build_bvh_recursive(nodes, tris, indices, start, mid);
+  int right_child = build_bvh_recursive(nodes, tris, indices, mid, end);
+  nodes[node_idx].left = left_child;
+  nodes[node_idx].right = right_child;
+  return node_idx;
+}
+
+static std::vector<BVHNode> build_bvh(const std::vector<Triangle> &tris) {
+  std::vector<BVHNode> nodes;
+  nodes.reserve(2 * tris.size());
+  std::vector<int> indices(tris.size());
+  for (int i = 0; i < (int)tris.size(); ++i)
+    indices[i] = i;
+  build_bvh_recursive(nodes, tris, indices, 0, (int)tris.size());
+  return nodes;
 }
 
 // ---------- CUDA device helpers ----------
@@ -306,11 +381,52 @@ __device__ float mesh_sdf_and_normal(float3 p, const Triangle *tris, int n_tris,
   return sign * sqrtf(min_d2);
 }
 
-// Area-weighted surface point sampler (uniform barycentric after triangle
-// selection).
+__device__ __forceinline__ float aabb_min_dist2(float3 p, float3 lo,
+                                                float3 hi) {
+  float dx = fmaxf(0.f, fmaxf(lo.x - p.x, p.x - hi.x));
+  float dy = fmaxf(0.f, fmaxf(lo.y - p.y, p.y - hi.y));
+  float dz = fmaxf(0.f, fmaxf(lo.z - p.z, p.z - hi.z));
+  return dx * dx + dy * dy + dz * dz;
+}
+
+// BVH traversal, root is always node 0
+__device__ float bvh_sdf_and_normal(float3 p, const Triangle *tris,
+                                    const BVHNode *bvh, float3 &out_n) {
+  float best_d2 = 1e30f, sign = 1.f;
+  out_n = {0.f, 1.f, 0.f};
+  int stack[64], top = 0;
+  stack[top++] = 0;
+  while (top > 0) {
+    const BVHNode &node = bvh[stack[--top]];
+    if (aabb_min_dist2(p, node.lo, node.hi) >= best_d2)
+      continue;
+    if (node.right < 0) {
+      const Triangle &t = tris[node.left];
+      float3 cp = closest_pt_triangle(p, t.v0, t.v1, t.v2);
+      float dx = p.x - cp.x, dy = p.y - cp.y, dz = p.z - cp.z;
+      float d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < best_d2) {
+        best_d2 = d2;
+        sign = (dx * t.n.x + dy * t.n.y + dz * t.n.z) >= 0.f ? 1.f : -1.f;
+        out_n = t.n;
+      }
+    } else {
+      stack[top++] = node.left;
+      stack[top++] = node.right;
+    }
+  }
+  return sign * sqrtf(best_d2);
+}
+
+__device__ float bvh_sdf(float3 p, const Triangle *tris, const BVHNode *bvh) {
+  float3 dummy;
+  return bvh_sdf_and_normal(p, tris, bvh, dummy);
+}
+
+// Area-weighted surface point sampler
 __device__ float3 sample_surface_pt(const Triangle *tris, int n_tris,
                                     const float *area_cdf, float total_area,
-                                    uint32_t &rng) {
+                                    uint32_t &rng, int *out_tri_idx = nullptr) {
   float u = pcg32f(rng) * total_area;
   int lo = 0, hi = n_tris - 1;
   while (lo < hi) {
@@ -320,6 +436,8 @@ __device__ float3 sample_surface_pt(const Triangle *tris, int n_tris,
     else
       hi = mid;
   }
+  if (out_tri_idx)
+    *out_tri_idx = lo;
   float r1 = sqrtf(pcg32f(rng)), r2 = pcg32f(rng);
   float a = 1.f - r1, b = r1 * (1.f - r2), c = r1 * r2;
   const Triangle &t = tris[lo];
@@ -333,13 +451,12 @@ __device__ float3 sample_surface_pt(const Triangle *tris, int n_tris,
 // Fills training_coords [3 × batch_size] (col-major: sample i at i*3+dim)
 // and training_sdf [1 × batch_size] (sample i at i).
 // Proportions from paper appendix C: 1/8 uniform, 4/8 surface, 3/8 perturbed.
-__global__ void
-generate_sdf_training_batch(int batch_size, int n_uniform, int n_surface,
-                            const Triangle *__restrict__ tris, int n_tris,
-                            const float *__restrict__ area_cdf,
-                            float total_area, float sigma, uint32_t base_seed,
-                            float *__restrict__ out_coords,
-                            float *__restrict__ out_sdf) {
+__global__ void generate_sdf_training_batch(
+    int batch_size, int n_uniform, int n_surface,
+    const Triangle *__restrict__ tris, const BVHNode *__restrict__ bvh,
+    int n_tris, const float *__restrict__ area_cdf, float total_area,
+    float sigma, uint32_t base_seed, float *__restrict__ out_coords,
+    float *__restrict__ out_sdf) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   if (i >= batch_size)
     return;
@@ -353,7 +470,7 @@ generate_sdf_training_batch(int batch_size, int n_uniform, int n_surface,
   if (i < n_uniform) {
     float px = pcg32f(rng), py = pcg32f(rng), pz = pcg32f(rng);
     p = {px, py, pz};
-    sdf_val = mesh_sdf(p, tris, n_tris);
+    sdf_val = bvh_sdf(p, tris, bvh);
   } else if (i < n_uniform + n_surface) {
     p = sample_surface_pt(tris, n_tris, area_cdf, total_area, rng);
     sdf_val = 0.f;
@@ -366,7 +483,7 @@ generate_sdf_training_batch(int batch_size, int n_uniform, int n_surface,
     p.x += sigma * sqrtf(-2.f * logf(u1)) * cosf(6.28318530718f * u2);
     p.y += sigma * sqrtf(-2.f * logf(u3)) * cosf(6.28318530718f * u4);
     p.z += sigma * sqrtf(-2.f * logf(u5)) * cosf(6.28318530718f * u6);
-    sdf_val = mesh_sdf(p, tris, n_tris);
+    sdf_val = bvh_sdf(p, tris, bvh);
   }
 
   out_coords[i * 3 + 0] = p.x;
@@ -563,62 +680,68 @@ __global__ void shade_and_pack(int N,
   out_rgba[i] = color;
 }
 
-// Samples N area-weighted GT surface points into out[3 × N] (col-major).
+// Samples N area-weighted GT surface points into out_pts[3 × N] (col-major).
+// Also writes the face normal of the sampled triangle into out_normals[3 × N].
 __global__ void
 sample_gt_surface_points(int N, const Triangle *__restrict__ tris, int n_tris,
                          const float *__restrict__ area_cdf, float total_area,
-                         uint32_t seed, float *__restrict__ out) {
+                         uint32_t seed, float *__restrict__ out_pts,
+                         float *__restrict__ out_normals) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   if (i >= N)
     return;
   uint32_t rng = seed ^ ((uint32_t)i * 2654435761u);
   pcg32_step(rng);
-  float3 p = sample_surface_pt(tris, n_tris, area_cdf, total_area, rng);
-  out[i * 3 + 0] = p.x;
-  out[i * 3 + 1] = p.y;
-  out[i * 3 + 2] = p.z;
+  int tri_idx;
+  float3 p =
+      sample_surface_pt(tris, n_tris, area_cdf, total_area, rng, &tri_idx);
+  out_pts[i * 3 + 0] = p.x;
+  out_pts[i * 3 + 1] = p.y;
+  out_pts[i * 3 + 2] = p.z;
+  out_normals[i * 3 + 0] = tris[tri_idx].n.x;
+  out_normals[i * 3 + 1] = tris[tri_idx].n.y;
+  out_normals[i * 3 + 2] = tris[tri_idx].n.z;
 }
 
-// For each hit pixel: GT mesh dist (learned→GT) and FD-normal vs GT-normal
-// angle. Non-hit pixels write 0.  Hit count accumulated via atomicAdd.
-__global__ void
-compute_hit_metrics(int N, const float *__restrict__ ray_pos,
-                    const uint8_t *__restrict__ ray_mask,
-                    const float *__restrict__ normals, // [3 × N] AoS
-                    const Triangle *__restrict__ tris, int n_tris,
-                    float *__restrict__ dist_buf, float *__restrict__ err_buf,
-                    int *__restrict__ hit_count) {
+// Evaluates the brute-force GT SDF at N query points using the BVH.
+// pts: (3, N) col-major.  out_sdf: (N,).
+__global__ void eval_gt_sdf_batch(int N, const float *__restrict__ pts,
+                                  const Triangle *__restrict__ tris,
+                                  const BVHNode *__restrict__ bvh,
+                                  float *__restrict__ out_sdf) {
   int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
   if (i >= N)
     return;
-  if (ray_mask[i] != 1) {
-    dist_buf[i] = 0.f;
-    err_buf[i] = 0.f;
+  float3 p = {pts[i * 3 + 0], pts[i * 3 + 1], pts[i * 3 + 2]};
+  out_sdf[i] = bvh_sdf(p, tris, bvh);
+}
+
+// Perturbs N GT surface points by isotropic Gaussian noise (std = sigma).
+// out_pts: (3, N) col-major.
+__global__ void perturb_surface_pts(int N, float sigma, uint32_t seed,
+                                    const float *__restrict__ base_pts,
+                                    float *__restrict__ out_pts) {
+  int i = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= N)
     return;
-  }
-  float3 p = {ray_pos[i * 3 + 0], ray_pos[i * 3 + 1], ray_pos[i * 3 + 2]};
-  float3 gt_n;
-  float gt_sdf = mesh_sdf_and_normal(p, tris, n_tris, gt_n);
-  dist_buf[i] = fabsf(gt_sdf);
-
-  float nx = normals[i * 3 + 0];
-  float ny = normals[i * 3 + 1];
-  float nz = normals[i * 3 + 2];
-  float inv = rsqrtf(nx * nx + ny * ny + nz * nz + 1e-8f);
-  nx *= inv;
-  ny *= inv;
-  nz *= inv;
-  float dot = fmaxf(-1.f, fminf(1.f, nx * gt_n.x + ny * gt_n.y + nz * gt_n.z));
-  err_buf[i] = acosf(fabsf(dot)) * (180.f / 3.14159265358979f);
-
-  atomicAdd(hit_count, 1);
+  uint32_t rng = seed ^ ((uint32_t)i * 2654435761u);
+  pcg32_step(rng);
+  float u1 = fmaxf(pcg32f(rng), 1e-8f), u2 = pcg32f(rng);
+  float u3 = fmaxf(pcg32f(rng), 1e-8f), u4 = pcg32f(rng);
+  float u5 = fmaxf(pcg32f(rng), 1e-8f), u6 = pcg32f(rng);
+  out_pts[i * 3 + 0] = base_pts[i * 3 + 0] + sigma * sqrtf(-2.f * logf(u1)) *
+                                                 cosf(6.28318530718f * u2);
+  out_pts[i * 3 + 1] = base_pts[i * 3 + 1] + sigma * sqrtf(-2.f * logf(u3)) *
+                                                 cosf(6.28318530718f * u4);
+  out_pts[i * 3 + 2] = base_pts[i * 3 + 2] + sigma * sqrtf(-2.f * logf(u5)) *
+                                                 cosf(6.28318530718f * u6);
 }
 
 // ---------- Misc ----------
 
 static int choose_cuda_device_for_gl_context() {
   unsigned int cnt = 0;
-  int devs[8] = {};
+  int devs[8] = {}; // surely no more than 8 gpus...
   cudaError_t e = cudaGLGetDevices(&cnt, devs, 8, cudaGLDeviceListCurrentFrame);
   if (e == cudaSuccess && cnt > 0)
     return devs[0];
@@ -663,51 +786,6 @@ __device__ __forceinline__ int hash3(int ix, int iy, int iz, int n_entries) {
                ((uint32_t)iy * kHashPrimes[1]) ^
                ((uint32_t)iz * kHashPrimes[2]);
   return (int)(h % (uint32_t)n_entries);
-}
-
-// 3-D spatial Gaussian blur over one hash-grid level. Iterates over a regular
-// grid of res_eff^3 cells (res_eff = min(res, cbrt(n_entries))), maps each to
-// its full-resolution position, reads neighbour features from src via the tcnn
-// hash function, and writes the smoothed result to dst. src and dst must not
-// alias. For levels with hash collisions, write races are benign: all
-// contending threads write a valid spatially-averaged value.
-__global__ void smooth_hash_level(const __half *__restrict__ src, __half *dst,
-                                  int n_entries, int n_features, int res,
-                                  int res_eff, float sigma) {
-  int cell = blockIdx.x * blockDim.x + threadIdx.x;
-  int n_cells = res_eff * res_eff * res_eff;
-  if (cell >= n_cells)
-    return;
-
-  int iz = cell / (res_eff * res_eff);
-  int iy = (cell / res_eff) % res_eff;
-  int ix = cell % res_eff;
-
-  // Map coarse cell index to full-resolution position.
-  int fx = ix * res / res_eff;
-  int fy = iy * res / res_eff;
-  int fz = iz * res / res_eff;
-
-  int dst_idx = hash3(fx, fy, fz, n_entries);
-  int r = (int)ceilf(3.f * sigma);
-  float inv2s2 = 0.5f / (sigma * sigma);
-
-  for (int f = 0; f < n_features; ++f) {
-    float acc = 0.f, w_sum = 0.f;
-    for (int dz = -r; dz <= r; ++dz)
-      for (int dy = -r; dy <= r; ++dy)
-        for (int dx = -r; dx <= r; ++dx) {
-          int nx = max(0, min(res - 1, fx + dx));
-          int ny = max(0, min(res - 1, fy + dy));
-          int nz = max(0, min(res - 1, fz + dz));
-          int src_idx = hash3(nx, ny, nz, n_entries);
-          float dist2 = (float)(dx * dx + dy * dy + dz * dz);
-          float w = expf(-dist2 * inv2s2);
-          acc += w * __half2float(src[src_idx * n_features + f]);
-          w_sum += w;
-        }
-    dst[dst_idx * n_features + f] = __float2half(acc / w_sum);
-  }
 }
 
 // Accumulate L1-TV gradient for one hash level into a float buffer (must be
@@ -813,6 +891,86 @@ __global__ void compute_eikonal_grad(int N_eik, int padded_out, float eps,
     dL_dsdf[(j * N_eik + i) * padded_out + 0] = __float2half(c * comp[j]);
 }
 
+// ---------- 3-D grain roughness metric ----------
+
+// Build 3*6*N probe positions for the grain metric.
+// Generates a 6-point central-difference FD stencil around each base point.
+// Layout: col = j*N + i  (FD offset j ∈ {0..5}, point i).
+// Offsets j: +x, -x, +y, -y, +z, -z at distance fd_eps.
+// base_pts: (3, N) col-major.  out_pts: (3, 6*N) col-major.
+__global__ void build_fd_stencil(int N, float fd_eps,
+                                 const float *__restrict__ base_pts,
+                                 float *__restrict__ out_pts) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N)
+    return;
+  float bx = base_pts[i * 3 + 0];
+  float by = base_pts[i * 3 + 1];
+  float bz = base_pts[i * 3 + 2];
+  const float ox[6] = {fd_eps, -fd_eps, 0.f, 0.f, 0.f, 0.f};
+  const float oy[6] = {0.f, 0.f, fd_eps, -fd_eps, 0.f, 0.f};
+  const float oz[6] = {0.f, 0.f, 0.f, 0.f, fd_eps, -fd_eps};
+  for (int j = 0; j < 6; ++j) {
+    int col = j * N + i;
+    out_pts[col * 3 + 0] = bx + ox[j];
+    out_pts[col * 3 + 1] = by + oy[j];
+    out_pts[col * 3 + 2] = bz + oz[j];
+  }
+}
+
+// ---------- Output-space SDF consistency loss ----------
+
+// Build k random perturbations of N_smooth base points.
+// base_pts: (3, batch_size) col-major — sample i at [i*3+0..2].
+// out_pts:  (3, k*N_smooth) col-major — perturbation j of sample i at
+// [(j*N+i)*3+0..2].
+__global__ void build_smooth_offsets(int N_smooth, int k_perturb, float eps,
+                                     const float *__restrict__ base_pts,
+                                     float *__restrict__ out_pts,
+                                     uint32_t seed) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N_smooth)
+    return;
+  float bx = base_pts[i * 3 + 0];
+  float by = base_pts[i * 3 + 1];
+  float bz = base_pts[i * 3 + 2];
+  uint32_t rng = seed ^ ((uint32_t)i * 2654435761u);
+  for (int j = 0; j < k_perturb; ++j) {
+    float u1 = pcg32f(rng);
+    float u2 = pcg32f(rng);
+    float cos_t = 1.f - 2.f * u1;
+    float sin_t = sqrtf(fmaxf(0.f, 1.f - cos_t * cos_t));
+    float phi = 6.28318530f * u2;
+    int out_i = j * N_smooth + i;
+    out_pts[out_i * 3 + 0] = bx + eps * sin_t * cosf(phi);
+    out_pts[out_i * 3 + 1] = by + eps * sin_t * sinf(phi);
+    out_pts[out_i * 3 + 2] = bz + eps * cos_t;
+  }
+}
+
+// Compute dL/dSDF for k*N_smooth perturbed SDF values.
+// Loss per base point i: lambda_smooth/N_smooth * var_j(SDF_{i,j}).
+// grad_buf must be zeroed before call; only feature 0 is written.
+__global__ void compute_smooth_grad(int N_smooth, int k_perturb, int padded_out,
+                                    float lambda_smooth, float loss_scale,
+                                    const __half *__restrict__ sdf_vals,
+                                    __half *__restrict__ dL_dsdf) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N_smooth)
+    return;
+  float mean = 0.f;
+  for (int j = 0; j < k_perturb; ++j)
+    mean += __half2float(sdf_vals[(j * N_smooth + i) * padded_out]);
+  mean /= (float)k_perturb;
+  float scale =
+      loss_scale * lambda_smooth * 2.f / ((float)k_perturb * (float)N_smooth);
+  for (int j = 0; j < k_perturb; ++j) {
+    float s = __half2float(sdf_vals[(j * N_smooth + i) * padded_out]);
+    dL_dsdf[(j * N_smooth + i) * padded_out + 0] =
+        __float2half(scale * (s - mean));
+  }
+}
+
 // ---------- main ----------
 using namespace tcnn;
 using precision_t = network_precision_t;
@@ -820,20 +978,23 @@ using precision_t = network_precision_t;
 int main(int argc, char **argv) {
   const char *mesh_path = "../data/bunny.obj";
   const char *run_name = "default";
-  float smooth_sigma = 0.f;
+
+  // most of these we no longer use but still keep in case...
   float lambda_tv = 0.f;
   float lambda_eik = 0.f;
   float eik_eps = 0.001f;
+  float lambda_smooth = 0.f;
+  float smooth_eps = 1e-3f;
   int tv_level_min = 11, tv_level_max = 15;
   int max_steps = 0;
   int hashmap_size = 19;
   int n_hash_levels = 16;
+  float growth_factor = 1.3819f;
+  bool no_hash = false;
 
   for (int ai = 1; ai < argc; ++ai) {
     if (strcmp(argv[ai], "--run") == 0 && ai + 1 < argc)
       run_name = argv[++ai];
-    else if (strcmp(argv[ai], "--sigma") == 0 && ai + 1 < argc)
-      smooth_sigma = (float)atof(argv[++ai]);
     else if (strcmp(argv[ai], "--lambda_tv") == 0 && ai + 1 < argc)
       lambda_tv = (float)atof(argv[++ai]);
     else if (strcmp(argv[ai], "--lambda_eik") == 0 && ai + 1 < argc)
@@ -850,6 +1011,14 @@ int main(int argc, char **argv) {
       hashmap_size = atoi(argv[++ai]);
     else if (strcmp(argv[ai], "--n_levels") == 0 && ai + 1 < argc)
       n_hash_levels = atoi(argv[++ai]);
+    else if (strcmp(argv[ai], "--growth_factor") == 0 && ai + 1 < argc)
+      growth_factor = (float)atof(argv[++ai]);
+    else if (strcmp(argv[ai], "--no_hash") == 0)
+      no_hash = true;
+    else if (strcmp(argv[ai], "--lambda_smooth") == 0 && ai + 1 < argc)
+      lambda_smooth = (float)atof(argv[++ai]);
+    else if (strcmp(argv[ai], "--smooth_eps") == 0 && ai + 1 < argc)
+      smooth_eps = (float)atof(argv[++ai]);
     else if (argv[ai][0] != '-')
       mesh_path = argv[ai];
   }
@@ -861,8 +1030,10 @@ int main(int argc, char **argv) {
   normalize_mesh(tris, bbox_min, bbox_max);
   int n_tris = (int)tris.size();
   printf("Loaded %s: %d triangles\n", mesh_path, n_tris);
+  std::vector<BVHNode> bvh_nodes = build_bvh(tris);
+  printf("BVH: %zu nodes\n", bvh_nodes.size());
 
-  // Extract stem (basename without extension) for the results subdirectory.
+  // extract stem
   const char *mesh_basename = mesh_path;
   for (const char *p = mesh_path; *p; ++p)
     if (*p == '/' || *p == '\\')
@@ -871,22 +1042,23 @@ int main(int argc, char **argv) {
   strncpy(mesh_stem, mesh_basename, sizeof(mesh_stem) - 1);
   mesh_stem[sizeof(mesh_stem) - 1] = '\0';
   char *stem_dot = strrchr(mesh_stem, '.');
-  if (stem_dot) *stem_dot = '\0';
+  if (stem_dot)
+    *stem_dot = '\0';
 
   char results_dir[512];
-  snprintf(results_dir, sizeof(results_dir), "results/%s", mesh_stem);
-  _mkdir("results");
+  snprintf(results_dir, sizeof(results_dir), "../results/%s", mesh_stem);
+  _mkdir("../results");
   _mkdir(results_dir);
 
   char metrics_path[600];
-  snprintf(metrics_path, sizeof(metrics_path), "%s/%s_metrics.csv", results_dir, run_name);
+  snprintf(metrics_path, sizeof(metrics_path), "%s/%s_metrics.csv", results_dir,
+           run_name);
   FILE *metrics_file = fopen(metrics_path, "w");
   if (metrics_file)
-    fprintf(metrics_file,
-            "step,sigma,lambda_tv,lambda_eik,hashmap_size,n_levels,"
-            "chamfer_dist,gt_to_learned,learned_to_gt,normal_err_deg,"
-            "grain_roughness,n_hits\n");
-  printf("Run '%s'  mesh '%s'  output -> %s/\n", run_name, mesh_stem, results_dir);
+    fprintf(metrics_file, "step,n_levels,hashmap_size,growth_factor,"
+                          "gt_to_learned,normal_err_vi_deg,sdf_psnr_db\n");
+  printf("Run '%s'  mesh '%s'  output -> %s/\n", run_name, mesh_stem,
+         results_dir);
 
   // Window
   RGFW_glHints *hints = RGFW_getGlobalHints_OpenGL();
@@ -950,6 +1122,8 @@ int main(int argc, char **argv) {
   // GPU mesh data
   GPUMemory<Triangle> gpu_tris(n_tris);
   gpu_tris.copy_from_host(tris.data());
+  GPUMemory<BVHNode> gpu_bvh(bvh_nodes.size());
+  gpu_bvh.copy_from_host(bvh_nodes.data());
 
   std::vector<float> area_cdf(n_tris);
   float total_area = 0.f;
@@ -1008,16 +1182,31 @@ int main(int argc, char **argv) {
   GPUMemory<float> analytic_normal_buf(3 * RENDER_N);
   GPUMatrix<float> analytic_normal_mat(analytic_normal_buf.data(), 3, RENDER_N);
 
-  // Metric buffers (Chamfer + normal consistency)
+  // Metric buffers (all view-independent)
   GPUMemory<float> gt_pts_buf(3 * N_METRIC_SAMPLES);
   GPUMatrix<float> gt_pts_input(gt_pts_buf.data(), 3, N_METRIC_SAMPLES);
+  GPUMemory<float> gt_normals_buf(3 * N_METRIC_SAMPLES);
   GPUMemory<float> gt_sdf_out_buf(N_METRIC_SAMPLES);
   GPUMatrix<float> gt_sdf_out_mat(gt_sdf_out_buf.data(), 1, N_METRIC_SAMPLES);
-  GPUMemory<float> metric_dist_buf(RENDER_N);
-  GPUMemory<float> metric_err_buf(RENDER_N);
-  GPUMemory<int> metric_hit_count_buf(1);
 
-  // Orbit camera: azimuth around Y, elevation above XZ, distance from target.
+  // FD stencil for view-independent normal error: 6 offsets × N surface points.
+  constexpr float kFdEps = 1e-3f;
+  constexpr int N_FD_TOTAL = 6 * N_METRIC_SAMPLES;
+  GPUMemory<float> fd_stencil_buf(3 * N_FD_TOTAL);
+  GPUMemory<float> fd_sdf_buf(N_FD_TOTAL);
+  GPUMatrix<float> fd_stencil_mat(fd_stencil_buf.data(), 3, N_FD_TOTAL);
+  GPUMatrix<float> fd_sdf_mat(fd_sdf_buf.data(), 1, N_FD_TOTAL);
+
+  // SDF PSNR: near-surface perturbed samples (σ = kPsnrSigma).
+  constexpr float kPsnrSigma = 0.02f;
+  GPUMemory<float> psnr_pts_buf(3 * N_METRIC_SAMPLES);
+  GPUMemory<float> psnr_gt_sdf_buf(N_METRIC_SAMPLES);
+  GPUMemory<float> psnr_learned_sdf_buf(N_METRIC_SAMPLES);
+  GPUMatrix<float> psnr_pts_mat(psnr_pts_buf.data(), 3, N_METRIC_SAMPLES);
+  GPUMatrix<float> psnr_learned_sdf_mat(psnr_learned_sdf_buf.data(), 1,
+                                        N_METRIC_SAMPLES);
+
+  // Y up/down
   float3 cam_target = {0.5f, 0.5f, 0.5f};
   float cam_azimuth = 0.f;
   float cam_elevation = 0.f;
@@ -1075,13 +1264,13 @@ int main(int argc, char **argv) {
             {"beta2", 0.99f},
             {"epsilon", 1e-15f},
             {"l2_reg", 1e-6f}}}}}}},
-      {"encoding",
-       {{"otype", "HashGrid"},
-        {"n_levels", n_hash_levels},
-        {"n_features_per_level", 2},
-        {"log2_hashmap_size", hashmap_size},
-        {"base_resolution", 16},
-        {"per_level_scale", 1.3819f}}},
+      {"encoding", no_hash ? json{{"otype", "Frequency"}, {"n_frequencies", 12}}
+                           : json{{"otype", "HashGrid"},
+                                  {"n_levels", n_hash_levels},
+                                  {"n_features_per_level", 2},
+                                  {"log2_hashmap_size", hashmap_size},
+                                  {"base_resolution", 16},
+                                  {"per_level_scale", growth_factor}}},
       {"network",
        {{"otype", "FullyFusedMLP"},
         {"activation", "ReLU"},
@@ -1131,13 +1320,16 @@ int main(int argc, char **argv) {
   const int kHashLevels = n_hash_levels, kHashFeat = 2,
             kHashLog2 = hashmap_size;
   constexpr int kHashBaseRes = 16;
-  constexpr float kHashScale = 1.3819f;
-  HashGridLayout hg_layout = compute_hash_grid_layout(
-      kHashLevels, kHashBaseRes, kHashScale, kHashLog2, kHashFeat);
-  assert(hg_layout.total == (int)network->encoding()->n_params());
-  int max_level_entries = *std::max_element(
-      hg_layout.entry_counts, hg_layout.entry_counts + kHashLevels);
-  GPUMemory<__half> smooth_tmp_buf(max_level_entries * kHashFeat);
+  float kHashScale = growth_factor;
+  HashGridLayout hg_layout{};
+  int max_level_entries = 0;
+  if (!no_hash) {
+    hg_layout = compute_hash_grid_layout(kHashLevels, kHashBaseRes, kHashScale,
+                                         kHashLog2, kHashFeat);
+    assert(hg_layout.total == (int)network->encoding()->n_params());
+    max_level_entries = *std::max_element(hg_layout.entry_counts,
+                                          hg_layout.entry_counts + kHashLevels);
+  }
   GPUMemory<float> tv_tmp_buf(max_level_entries * kHashFeat);
 
   constexpr int N_EIK = 1024;
@@ -1149,6 +1341,18 @@ int main(int argc, char **argv) {
   GPUMatrix<precision_t> eik_grad_mat(eik_grad_buf.data(), padded_out,
                                       6 * N_EIK);
 
+  constexpr int N_SMOOTH = 16384;
+  constexpr int K_SMOOTH = 4;
+  GPUMemory<float> smooth_pts_buf(3 * K_SMOOTH * N_SMOOTH);
+  GPUMemory<precision_t> smooth_sdf_buf(padded_out * K_SMOOTH * N_SMOOTH);
+  GPUMemory<precision_t> smooth_grad_buf(padded_out * K_SMOOTH * N_SMOOTH);
+  GPUMatrix<float> smooth_input_mat(smooth_pts_buf.data(), 3,
+                                    K_SMOOTH * N_SMOOTH);
+  GPUMatrix<precision_t> smooth_sdf_mat(smooth_sdf_buf.data(), padded_out,
+                                        K_SMOOTH * N_SMOOTH);
+  GPUMatrix<precision_t> smooth_grad_mat(smooth_grad_buf.data(), padded_out,
+                                         K_SMOOTH * N_SMOOTH);
+
   bool running = true;
   bool training_enabled = true;
   bool mouse_dragging = false;
@@ -1156,15 +1360,14 @@ int main(int argc, char **argv) {
   float current_loss = 0.f;
 
   int render_mode = 0;
-  float last_chamfer = 0.f, last_gt_to_learned = 0.f, last_learned_to_gt = 0.f;
-  float last_normal_err = 0.f, last_grain_roughness = 0.f;
-  int last_n_hits = 0;
+  float last_gt_to_learned = 0.f;
+  float last_normal_err_vi = 0.f;
+  float last_sdf_psnr = 0.f;
   std::vector<float> cpu_gt_sdf(N_METRIC_SAMPLES);
-  std::vector<float> cpu_dist(RENDER_N);
-  std::vector<float> cpu_err(RENDER_N);
-  std::vector<int> cpu_hit_count(1, 0);
-  std::vector<float> cpu_normals(3 * RENDER_N);
-  std::vector<uint8_t> cpu_ray_mask(RENDER_N);
+  std::vector<float> cpu_gt_normals(3 * N_METRIC_SAMPLES);
+  std::vector<float> cpu_fd_sdf(N_FD_TOTAL);
+  std::vector<float> cpu_psnr_gt_sdf(N_METRIC_SAMPLES);
+  std::vector<float> cpu_psnr_learned_sdf(N_METRIC_SAMPLES);
 
   std::vector<uint8_t> render_pixels(RENDER_W * RENDER_H * 4);
   GPUMemory<uchar4> snap_buf(RENDER_N);
@@ -1225,16 +1428,16 @@ int main(int argc, char **argv) {
     if (training_enabled) {
       generate_sdf_training_batch<<<((int)batch_size + 255) / 256, 256, 0,
                                     stream>>>(
-          (int)batch_size, n_uniform, n_surface, gpu_tris.data(), n_tris,
-          gpu_area_cdf.data(), total_area, 0.0005f, step * 1234567u,
-          training_batch.data(), training_target.data());
+          (int)batch_size, n_uniform, n_surface, gpu_tris.data(),
+          gpu_bvh.data(), n_tris, gpu_area_cdf.data(), total_area, 0.0005f,
+          step * 1234567u, training_batch.data(), training_target.data());
       CUDA_CHECK_THROW(cudaGetLastError());
 
       auto ctx = trainer->training_step(stream, training_batch, training_target,
                                         nullptr, /*run_optimizer=*/false);
       current_loss = trainer->loss(stream, *ctx);
 
-      if (lambda_tv > 0.f) {
+      if (!no_hash && lambda_tv > 0.f) {
         __half *params = network->encoding()->params();
         __half *grad = trainer->param_gradients();
         int lmin = max(0, min(15, tv_level_min));
@@ -1271,31 +1474,24 @@ int main(int argc, char **argv) {
                           eik_grad_mat, nullptr, false,
                           GradientMode::Accumulate);
       }
-      trainer->optimizer_step(stream, default_loss_scale<precision_t>());
-
-      if (smooth_sigma > 0.f) {
-        __half *inf = network->encoding()->inference_params();
-        for (int k = 0; k < kHashLevels; ++k) {
-          int ne = hg_layout.entry_counts[k];
-          int res = hg_layout.cell_res[k];
-          long long res3 = (long long)res * res * res;
-          int res_eff = (res3 <= (long long)ne) ? res : (int)cbrtf((float)ne);
-          int n_cells = res_eff * res_eff * res_eff;
-          // Init tmp with src so entries not covered by coarse grid keep their
-          // values.
-          CUDA_CHECK_THROW(cudaMemcpyAsync(smooth_tmp_buf.data(),
-                                           inf + hg_layout.offsets[k],
-                                           ne * kHashFeat * sizeof(__half),
-                                           cudaMemcpyDeviceToDevice, stream));
-          smooth_hash_level<<<(n_cells + 255) / 256, 256, 0, stream>>>(
-              inf + hg_layout.offsets[k], smooth_tmp_buf.data(), ne, kHashFeat,
-              res, res_eff, smooth_sigma);
-          CUDA_CHECK_THROW(cudaMemcpyAsync(inf + hg_layout.offsets[k],
-                                           smooth_tmp_buf.data(),
-                                           ne * kHashFeat * sizeof(__half),
-                                           cudaMemcpyDeviceToDevice, stream));
-        }
+      if (lambda_smooth > 0.f) {
+        build_smooth_offsets<<<(N_SMOOTH + 255) / 256, 256, 0, stream>>>(
+            N_SMOOTH, K_SMOOTH, smooth_eps, training_batch.data(),
+            smooth_pts_buf.data(), step * 7654321u);
+        auto sm_ctx = network->forward(stream, smooth_input_mat,
+                                       &smooth_sdf_mat, false, false);
+        CUDA_CHECK_THROW(cudaMemsetAsync(
+            smooth_grad_buf.data(), 0,
+            padded_out * K_SMOOTH * N_SMOOTH * sizeof(precision_t), stream));
+        compute_smooth_grad<<<(N_SMOOTH + 255) / 256, 256, 0, stream>>>(
+            N_SMOOTH, K_SMOOTH, padded_out, lambda_smooth,
+            (float)default_loss_scale<precision_t>(), smooth_sdf_buf.data(),
+            smooth_grad_buf.data());
+        network->backward(stream, *sm_ctx, smooth_input_mat, smooth_sdf_mat,
+                          smooth_grad_mat, nullptr, false,
+                          GradientMode::Accumulate);
       }
+      trainer->optimizer_step(stream, default_loss_scale<precision_t>());
 
       loss_history[hist_offset] = current_loss;
       hist_offset = (hist_offset + 1) % kHistSz;
@@ -1360,95 +1556,206 @@ int main(int argc, char **argv) {
                        RENDER_W * 4);
         stbi_flip_vertically_on_write(0);
         printf("Saved %s\n", snap_path);
+
+        // Per-level ablation and additivity test at the final step.
+        if (at_final && !no_hash) {
+          int total_fp16 = (int)network->encoding()->n_params();
+          precision_t *inf_params = network->encoding()->inference_params();
+          std::vector<precision_t> inf_backup(total_fp16);
+          CUDA_CHECK_THROW(cudaMemcpy(inf_backup.data(), inf_params,
+                                      total_fp16 * sizeof(precision_t),
+                                      cudaMemcpyDeviceToHost));
+
+          // --- Per-level ablation: render normal-map with only level k active
+          // ---
+          for (int lev = 0; lev < kHashLevels; ++lev) {
+            CUDA_CHECK_THROW(
+                cudaMemset(inf_params, 0, total_fp16 * sizeof(precision_t)));
+            int lev_start = hg_layout.offsets[lev];
+            int lev_count = hg_layout.entry_counts[lev] * kHashFeat;
+            CUDA_CHECK_THROW(cudaMemcpy(
+                inf_params + lev_start, inf_backup.data() + lev_start,
+                lev_count * sizeof(precision_t), cudaMemcpyHostToDevice));
+
+            // Re-render (sphere-trace + normals + shade).
+            init_rays<<<ray_grid2d, ray_block2d, 0, stream>>>(
+                RENDER_W, RENDER_H, cam_eye, cam_fwd, cam_right, cam_up,
+                cam_fov, ray_pos_buf.data(), ray_dir_buf.data(),
+                ray_t_buf.data(), ray_tmax_buf.data(), ray_mask_buf.data(),
+                ray_prev_sdf_buf.data(), ray_prev_pos_buf.data());
+            for (int r = 0; r < 64; ++r) {
+              network->inference(stream, ray_input, ray_sdf_out);
+              march_rays<<<ray_blocks1d, 256, 0, stream>>>(
+                  RENDER_N, 5e-5f, 5e-5f, ray_sdf_out.data(),
+                  ray_dir_buf.data(), ray_pos_buf.data(), ray_t_buf.data(),
+                  ray_tmax_buf.data(), ray_mask_buf.data(),
+                  ray_prev_sdf_buf.data(), ray_prev_pos_buf.data());
+            }
+            auto ab_ctx = network->forward(stream, ray_input, &ray_sdf_half_out,
+                                           true, true);
+            network->backward(stream, *ab_ctx, ray_input, ray_sdf_half_out,
+                              dL_dsdf_mat, &analytic_normal_mat, true,
+                              GradientMode::Ignore);
+            shade_and_pack<<<ray_blocks1d, 256, 0, stream>>>(
+                RENDER_N, analytic_normal_buf.data(), ray_pos_buf.data(),
+                ray_dir_buf.data(), ray_mask_buf.data(), light_pos, 1,
+                snap_buf.data());
+            CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+            snap_buf.copy_to_host(
+                reinterpret_cast<uchar4 *>(render_pixels.data()));
+            char ab_path[600];
+            snprintf(ab_path, sizeof(ab_path), "%s/%s_ablation_level_%02d.png",
+                     results_dir, run_name, lev);
+            stbi_flip_vertically_on_write(1);
+            stbi_write_png(ab_path, RENDER_W, RENDER_H, 4, render_pixels.data(),
+                           RENDER_W * 4);
+            stbi_flip_vertically_on_write(0);
+            printf("Saved %s\n", ab_path);
+          }
+
+          // Restore full inference_params.
+          CUDA_CHECK_THROW(cudaMemcpy(inf_params, inf_backup.data(),
+                                      total_fp16 * sizeof(precision_t),
+                                      cudaMemcpyHostToDevice));
+
+          // --- Additivity test: does sum_k f(x; level k) ≈ f(x; all levels)?
+          // --- Uses psnr_pts_buf (near-surface, σ=0.02 off surface) so f_full
+          // ≠ 0. Normalization: mean_abs_error / mean_abs(f_full) to avoid
+          // division by near-zero values that arise at exact surface points.
+          std::vector<float> f_full(N_METRIC_SAMPLES, 0.f);
+          std::vector<float> f_sum(N_METRIC_SAMPLES, 0.f);
+
+          // Full model output at near-surface points.
+          network->inference(stream, psnr_pts_mat, psnr_learned_sdf_mat);
+          CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+          psnr_learned_sdf_buf.copy_to_host(f_full.data(), N_METRIC_SAMPLES);
+
+          // Per-level outputs at the same near-surface points.
+          for (int lev = 0; lev < kHashLevels; ++lev) {
+            CUDA_CHECK_THROW(
+                cudaMemset(inf_params, 0, total_fp16 * sizeof(precision_t)));
+            int lev_start = hg_layout.offsets[lev];
+            int lev_count = hg_layout.entry_counts[lev] * kHashFeat;
+            CUDA_CHECK_THROW(cudaMemcpy(
+                inf_params + lev_start, inf_backup.data() + lev_start,
+                lev_count * sizeof(precision_t), cudaMemcpyHostToDevice));
+            network->inference(stream, psnr_pts_mat, psnr_learned_sdf_mat);
+            CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
+            psnr_learned_sdf_buf.copy_to_host(cpu_psnr_learned_sdf.data(),
+                                              N_METRIC_SAMPLES);
+            for (int j = 0; j < N_METRIC_SAMPLES; ++j)
+              f_sum[j] += cpu_psnr_learned_sdf[j];
+          }
+
+          // Restore full inference_params again.
+          CUDA_CHECK_THROW(cudaMemcpy(inf_params, inf_backup.data(),
+                                      total_fp16 * sizeof(precision_t),
+                                      cudaMemcpyHostToDevice));
+
+          // Relative additivity error: mean_abs_diff / mean_abs(f_full).
+          double mean_abs_diff = 0.0, mean_abs_full = 0.0;
+          for (int j = 0; j < N_METRIC_SAMPLES; ++j) {
+            mean_abs_diff += (double)fabsf(f_sum[j] - f_full[j]);
+            mean_abs_full += (double)fabsf(f_full[j]);
+          }
+          mean_abs_diff /= N_METRIC_SAMPLES;
+          mean_abs_full /= N_METRIC_SAMPLES;
+          double add_err = mean_abs_diff / (mean_abs_full + 1e-6);
+
+          char add_path[600];
+          snprintf(add_path, sizeof(add_path), "%s/%s_additivity.txt",
+                   results_dir, run_name);
+          if (FILE *af = fopen(add_path, "w")) {
+            fprintf(af, "additivity_error=%.6f\n", (float)add_err);
+            fclose(af);
+          }
+          printf("Additivity error: %.4f  -> %s\n", (float)add_err, add_path);
+        }
       }
     }
 
-    // ----- Metrics (every METRIC_INTERVAL training steps) -----
+    // ----- Metrics (every METRIC_INTERVAL training steps, all
+    // view-independent) -----
     if (training_enabled && step > 0 && step % METRIC_INTERVAL == 0) {
+      // Sample GT surface points with face normals.
       sample_gt_surface_points<<<(N_METRIC_SAMPLES + 255) / 256, 256, 0,
                                  stream>>>(
           N_METRIC_SAMPLES, gpu_tris.data(), n_tris, gpu_area_cdf.data(),
-          total_area, step * 987654321u, gt_pts_buf.data());
+          total_area, step * 987654321u, gt_pts_buf.data(),
+          gt_normals_buf.data());
+
+      // gt_to_learned: mean |f(x)| at GT surface samples.
       network->inference(stream, gt_pts_input, gt_sdf_out_mat);
 
-      CUDA_CHECK_THROW(
-          cudaMemsetAsync(metric_hit_count_buf.data(), 0, sizeof(int), stream));
-      compute_hit_metrics<<<ray_blocks1d, 256, 0, stream>>>(
-          RENDER_N, ray_pos_buf.data(), ray_mask_buf.data(),
-          analytic_normal_buf.data(), gpu_tris.data(), n_tris,
-          metric_dist_buf.data(), metric_err_buf.data(),
-          metric_hit_count_buf.data());
+      // View-independent normal error: FD stencil at GT surface points.
+      build_fd_stencil<<<(N_METRIC_SAMPLES + 255) / 256, 256, 0, stream>>>(
+          N_METRIC_SAMPLES, kFdEps, gt_pts_buf.data(), fd_stencil_buf.data());
+      network->inference(stream, fd_stencil_mat, fd_sdf_mat);
+
+      // SDF PSNR: perturb surface pts by σ=kPsnrSigma, evaluate GT SDF
+      // (brute-force) and learned SDF at those near-surface points.
+      perturb_surface_pts<<<(N_METRIC_SAMPLES + 255) / 256, 256, 0, stream>>>(
+          N_METRIC_SAMPLES, kPsnrSigma, step * 123456789u, gt_pts_buf.data(),
+          psnr_pts_buf.data());
+      eval_gt_sdf_batch<<<(N_METRIC_SAMPLES + 255) / 256, 256, 0, stream>>>(
+          N_METRIC_SAMPLES, psnr_pts_buf.data(), gpu_tris.data(),
+          gpu_bvh.data(), psnr_gt_sdf_buf.data());
+      network->inference(stream, psnr_pts_mat, psnr_learned_sdf_mat);
 
       CUDA_CHECK_THROW(cudaStreamSynchronize(stream));
 
       gt_sdf_out_buf.copy_to_host(cpu_gt_sdf.data(), N_METRIC_SAMPLES);
-      metric_dist_buf.copy_to_host(cpu_dist.data(), RENDER_N);
-      metric_err_buf.copy_to_host(cpu_err.data(), RENDER_N);
-      metric_hit_count_buf.copy_to_host(cpu_hit_count.data(), 1);
-      analytic_normal_buf.copy_to_host(cpu_normals.data(), 3 * RENDER_N);
-      ray_mask_buf.copy_to_host(cpu_ray_mask.data(), RENDER_N);
+      gt_normals_buf.copy_to_host(cpu_gt_normals.data(), 3 * N_METRIC_SAMPLES);
+      fd_sdf_buf.copy_to_host(cpu_fd_sdf.data(), N_FD_TOTAL);
+      psnr_gt_sdf_buf.copy_to_host(cpu_psnr_gt_sdf.data(), N_METRIC_SAMPLES);
+      psnr_learned_sdf_buf.copy_to_host(cpu_psnr_learned_sdf.data(),
+                                        N_METRIC_SAMPLES);
 
-      last_n_hits = cpu_hit_count[0];
-
+      // gt_to_learned.
       last_gt_to_learned = 0.f;
       for (int j = 0; j < N_METRIC_SAMPLES; ++j)
         last_gt_to_learned += fabsf(cpu_gt_sdf[j]);
       last_gt_to_learned /= (float)N_METRIC_SAMPLES;
 
-      last_learned_to_gt = 0.f;
-      last_normal_err = 0.f;
-      for (int j = 0; j < RENDER_N; ++j) {
-        last_learned_to_gt += cpu_dist[j];
-        last_normal_err += cpu_err[j];
+      // View-independent normal error: FD normal at GT surface pts vs GT face
+      // normal.
+      last_normal_err_vi = 0.f;
+      for (int i = 0; i < N_METRIC_SAMPLES; ++i) {
+        const int N = N_METRIC_SAMPLES;
+        float gx =
+            (cpu_fd_sdf[0 * N + i] - cpu_fd_sdf[1 * N + i]) / (2.f * kFdEps);
+        float gy =
+            (cpu_fd_sdf[2 * N + i] - cpu_fd_sdf[3 * N + i]) / (2.f * kFdEps);
+        float gz =
+            (cpu_fd_sdf[4 * N + i] - cpu_fd_sdf[5 * N + i]) / (2.f * kFdEps);
+        float l = sqrtf(gx * gx + gy * gy + gz * gz + 1e-8f);
+        float nx = gx / l, ny = gy / l, nz = gz / l;
+        float gnx = cpu_gt_normals[i * 3 + 0];
+        float gny = cpu_gt_normals[i * 3 + 1];
+        float gnz = cpu_gt_normals[i * 3 + 2];
+        float d = fmaxf(-1.f, fminf(1.f, nx * gnx + ny * gny + nz * gnz));
+        last_normal_err_vi += acosf(fabsf(d));
       }
-      if (last_n_hits > 0) {
-        last_learned_to_gt /= (float)last_n_hits;
-        last_normal_err /= (float)last_n_hits;
-      }
-      last_chamfer = 0.5f * (last_gt_to_learned + last_learned_to_gt);
+      last_normal_err_vi =
+          last_normal_err_vi / (float)N_METRIC_SAMPLES * (180.f / 3.14159265f);
 
-      // Grain roughness: mean angular deviation between adjacent hit-pixel
-      // normals.
-      {
-        float rsum = 0.f;
-        int rcnt = 0;
-        for (int py = 1; py < RENDER_H - 1; ++py) {
-          for (int px = 1; px < RENDER_W - 1; ++px) {
-            int i = py * RENDER_W + px;
-            if (cpu_ray_mask[i] != 1)
-              continue;
-            float nx = cpu_normals[i * 3], ny = cpu_normals[i * 3 + 1],
-                  nz = cpu_normals[i * 3 + 2];
-            float nl = sqrtf(nx * nx + ny * ny + nz * nz + 1e-8f);
-            nx /= nl;
-            ny /= nl;
-            nz /= nl;
-            const int nbs[4] = {i - 1, i + 1, i - RENDER_W, i + RENDER_W};
-            for (int nb : nbs) {
-              if (cpu_ray_mask[nb] != 1)
-                continue;
-              float mx = cpu_normals[nb * 3], my = cpu_normals[nb * 3 + 1],
-                    mz = cpu_normals[nb * 3 + 2];
-              float ml = sqrtf(mx * mx + my * my + mz * mz + 1e-8f);
-              mx /= ml;
-              my /= ml;
-              mz /= ml;
-              float dot = fmaxf(-1.f, fminf(1.f, nx * mx + ny * my + nz * mz));
-              rsum += acosf(fabsf(dot)) * (180.f / 3.14159265f);
-              ++rcnt;
-            }
-          }
-        }
-        last_grain_roughness = rcnt > 0 ? rsum / rcnt : 0.f;
+      // SDF PSNR: signal = mean(gt²), noise = MSE(learned - gt).
+      double signal_power = 0.0, mse = 0.0;
+      for (int j = 0; j < N_METRIC_SAMPLES; ++j) {
+        double gt = (double)cpu_psnr_gt_sdf[j];
+        double err = (double)cpu_psnr_learned_sdf[j] - gt;
+        signal_power += gt * gt;
+        mse += err * err;
       }
+      signal_power /= N_METRIC_SAMPLES;
+      mse /= N_METRIC_SAMPLES;
+      last_sdf_psnr =
+          (mse > 1e-12) ? (float)(10.0 * log10(signal_power / mse)) : 999.f;
 
       if (metrics_file) {
-        fprintf(metrics_file,
-                "%u,%.4f,%.2e,%.2e,%d,%d,%.8f,%.8f,%.8f,%.4f,%.4f,%d\n", step,
-                smooth_sigma, lambda_tv, lambda_eik, hashmap_size,
-                n_hash_levels, last_chamfer, last_gt_to_learned,
-                last_learned_to_gt, last_normal_err, last_grain_roughness,
-                last_n_hits);
+        fprintf(metrics_file, "%u,%d,%d,%.4f,%.8f,%.4f,%.4f\n", step,
+                n_hash_levels, hashmap_size, kHashScale, last_gt_to_learned,
+                last_normal_err_vi, last_sdf_psnr);
         fflush(metrics_file);
       }
     }
@@ -1513,9 +1820,9 @@ int main(int argc, char **argv) {
       hist_offset = 0;
       hist_count = 0;
       std::fill(loss_history.begin(), loss_history.end(), 0.f);
-      last_chamfer = last_gt_to_learned = last_learned_to_gt = 0.f;
-      last_normal_err = 0.f;
-      last_n_hits = 0;
+      last_gt_to_learned = 0.f;
+      last_normal_err_vi = 0.f;
+      last_sdf_psnr = 0.f;
     }
     ImGui::Text("Status: %s   Step: %u",
                 training_enabled ? "Running" : "Paused", step);
@@ -1544,20 +1851,18 @@ int main(int argc, char **argv) {
       printf("Saved %s\n", fname);
     }
     ImGui::Separator();
-    ImGui::Text("Chamfer:     %.6f", last_chamfer);
-    ImGui::Text("  GT->Net:   %.6f   Net->GT: %.6f", last_gt_to_learned,
-                last_learned_to_gt);
-    ImGui::Text("Normal err:  %.2f deg  (%d hits)", last_normal_err,
-                last_n_hits);
-    ImGui::Text("Grain rough: %.4f deg", last_grain_roughness);
+    ImGui::Text("GT->Net:     %.6f", last_gt_to_learned);
+    ImGui::Text("Normal err:  %.2f deg (VI)", last_normal_err_vi);
+    ImGui::Text("SDF PSNR:    %.2f dB", last_sdf_psnr);
     ImGui::TextDisabled("(updated every %d steps)", METRIC_INTERVAL);
     ImGui::Separator();
-    ImGui::SliderFloat("Smooth sigma", &smooth_sigma, 0.f, 3.f, "%.2f");
     ImGui::SliderFloat("TV lambda", &lambda_tv, 0.f, 1e-4f, "%.2e");
     ImGui::SliderInt("TV level min", &tv_level_min, 0, 15);
     ImGui::SliderInt("TV level max", &tv_level_max, 0, 15);
     ImGui::SliderFloat("Eikonal lambda", &lambda_eik, 0.f, 0.1f, "%.4f");
     ImGui::SliderFloat("Eikonal eps", &eik_eps, 1e-4f, 1e-2f, "%.4f");
+    ImGui::SliderFloat("Smooth lambda", &lambda_smooth, 0.f, 0.1f, "%.2e");
+    ImGui::SliderFloat("Smooth eps", &smooth_eps, 1e-4f, 5e-3f, "%.2e");
     ImGui::Separator();
     ImGui::Text("Run: %s", run_name);
     ImGui::TextDisabled("Output: %s/", results_dir);
